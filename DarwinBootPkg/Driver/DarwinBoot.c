@@ -19,6 +19,15 @@
 
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
+
+//
+// One past the top of the RAM this board actually has.
+//
+// From /proc/iomem on the running phone: 0x9B000000..0xABFFFFFF and 0xAD000000..0xBB AFFFFF.
+// A page allocated above this is not memory, and AllocatePages returned 0x35C989000 once - ten
+// gigabytes past the end of anything described - so the ceiling is stated here and checked.
+//
+#define DRAM_TOP     0xBC000000U
 #define MAX_SEGMENTS 64
 
 typedef struct {
@@ -42,6 +51,37 @@ UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
+
+//
+// Progress the eye can see.
+//
+// Print() writes to the text console, and on this board that console is not the surface UniXNU
+// paints: lines appear there only by accident, and the screen keeps showing an older frame, so
+// a boot that stalls after "getinfo" looks exactly like one that never printed it. OutputString
+// on gST->ConOut reaches the same console the menu text uses, and a form feed ahead of each line
+// replaces the frame rather than scrolling behind it.
+//
+STATIC
+VOID
+Band (
+  IN CONST CHAR16  *Line
+  )
+{
+  if ((gST == NULL) || (gST->ConOut == NULL) || (Line == NULL)) {
+    return;
+  }
+
+  gST->ConOut->OutputString (gST->ConOut, (CHAR16 *)L"\f");
+  gST->ConOut->OutputString (gST->ConOut, (CHAR16 *)Line);
+}
+
+STATIC
+VOID
+BandInit (
+  VOID
+  )
+{
+}
 
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
@@ -81,31 +121,115 @@ ReadFile (
 
   *Data = NULL;
   *Size = 0;
+  Band (L"DB01 open");
   Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
+  Band (L"DB02 opened");
   if (EFI_ERROR (Status)) { return Status; }
-  Info = NULL;
-  InfoSize = 0;
-  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
-  if (Status != EFI_BUFFER_TOO_SMALL) { goto Done; }
-  Info = AllocatePool (InfoSize);
+  Info = AllocatePages (EFI_SIZE_TO_PAGES (SIZE_OF_EFI_FILE_INFO + 512));
   if (Info == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
+  InfoSize = SIZE_OF_EFI_FILE_INFO + 512;
+  Band (L"DB03 getinfo");
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
-  if (EFI_ERROR (Status)) { goto Done; }
+  Band (L"DB04 gotinfo");
+  if (Status != EFI_SUCCESS) { Print (L"DARWINBOOT: getinfo failed\n"); goto Done; }
+  Band (L"DB05 check");
   if ((Info->Attribute & EFI_FILE_DIRECTORY) || (Info->FileSize == 0) || (Info->FileSize > Limit)) {
     Print (L"DARWINBOOT: %s attr %lx size %lu limit %lu\n", Path, (UINT64)Info->Attribute, (UINT64)Info->FileSize, (UINT64)Limit);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Done;
   }
   *Size = (UINTN)Info->FileSize;
-  *Data = AllocatePool (*Size);
+  Band (L"DB06 sized");
+
+  //
+  // Pages, not the pool.
+  //
+  // A fifty-four megabyte pool allocation makes the pool allocator walk its largest-free
+  // descriptor list, and on this board that walk does not finish - the boot stops with
+  // "reading kernel" on the screen and nothing after it. AllocatePages asks the page allocator
+  // for one contiguous range instead, which is a single lookup.
+  //
+  //
+  // A buffer the kernel can actually be read into.
+  //
+  // AllocatePages returned 0x35C989000 for this request - fourteen gigabytes, past the end of
+  // every range this platform describes. The read that followed never returned, which is what
+  // writing to an address no MMU entry covers does here. So the address is checked before it
+  // is used: anything outside the RAM this board actually has is rejected, and the buffer is
+  // then taken from a conventional range in the map by hand.
+  //
+  Band (L"DB07 alloc");
+  *Data = NULL;
+  //
+  // The top of the RAM this board actually has, from /proc/iomem on the running phone:
+  // 0x9B000000..0xABFFFFFF and 0xAD000000..0xBB AFFFFF. Ten gigabytes of headroom above that
+  // is not memory, and asking for a page there is what produced 0x35C989000.
+  //
+  //
+  {
+    EFI_PHYSICAL_ADDRESS  Pages;
+
+    Pages = DRAM_TOP;
+    if (!EFI_ERROR (gBS->AllocatePages (AllocateMaxAddress, EfiLoaderData, EFI_SIZE_TO_PAGES (*Size), &Pages))) {
+      *Data = (VOID *)(UINTN)Pages;
+    }
+
+    if ((*Data == NULL) || ((UINTN)*Data >= DRAM_TOP)) {
+      CHAR16  Where[96];
+
+      UnicodeSPrint (Where, sizeof (Where), L"DB07a no page under DRAM top %p", *Data);
+      Band (Where);
+      *Data = NULL;
+    }
+  }
+
+  {
+    CHAR16  Where[96];
+
+    UnicodeSPrint (Where, sizeof (Where), L"DB08 allocated %p size %lu", *Data, (UINT64)*Size);
+    Band (Where);
+  }
   if (*Data == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
-  Actual = *Size;
-  Status = File->Read (File, &Actual, *Data);
+
+  //
+  // Read in pieces, reporting after each.
+  //
+  // The whole image in one call was the next place the boot went quiet: the size is not known
+  // until GetInfo answers, and a single fifty-four megabyte read leaves nothing to say when it
+  // is the read itself that stalls.
+  //
+  Actual = 0;
+  while (Actual < *Size) {
+    UINTN   Chunk = *Size - Actual;
+    CHAR16  Progress[96];
+
+    if (Chunk > SIZE_8MB) {
+      Chunk = SIZE_8MB;
+    }
+
+    //
+    // One band per piece, before and after the read.
+    //
+    // Print() writes to a console this board does not paint, so a read that never returns
+    // looked exactly like one that had not started. Band() replaces the frame, which is what
+    // the rest of this file uses for the same reason.
+    //
+    UnicodeSPrint (Progress, sizeof (Progress), L"DB09 read %lu of %lu", (UINT64)Actual, (UINT64)*Size);
+    Band (Progress);
+    Status = File->Read (File, &Chunk, (UINT8 *)*Data + Actual);
+    UnicodeSPrint (Progress, sizeof (Progress), L"DB10 read %lu of %lu %r", (UINT64)(Actual + Chunk), (UINT64)*Size, Status);
+    Band (Progress);
+    if (EFI_ERROR (Status)) { goto Done; }
+    if (Chunk == 0) { break; }
+    Actual += Chunk;
+  }
+
+  Status = EFI_SUCCESS;
   if (!EFI_ERROR (Status) && (Actual != *Size)) { Status = EFI_DEVICE_ERROR; }
 Done:
-  if (Info != NULL) { FreePool (Info); }
+  if (Info != NULL) { FreePages (Info, EFI_SIZE_TO_PAGES (SIZE_OF_EFI_FILE_INFO + 512)); }
   File->Close (File);
-  if (EFI_ERROR (Status) && (*Data != NULL)) { FreePool (*Data); *Data = NULL; }
+  if (EFI_ERROR (Status) && (*Data != NULL)) { FreePages (*Data, EFI_SIZE_TO_PAGES (*Size)); *Data = NULL; }
   return Status;
 }
 
@@ -503,14 +627,26 @@ Boot (
   UINT64                          Video[6];
 
   (VOID)This;
+
+  //
+  // Leave a trail for the menu.
+  //
+  // Print() goes to the console this driver shares with UniXNU, and UniXNU repaints the screen
+  // as soon as the boot returns, so nothing printed here survives long enough to be read. The
+  // slot is memory UniXNU already knows how to show.
+  //
+#define DBTRACE(Stage)  (*(volatile UINT64 *)(UINTN)0x9FFFE000 = (UINT64)(Stage))
+
+  DBTRACE (1);
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+  DBTRACE (2);
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
       (DarwinCurrentEl () != 4)) {
-    Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
+    DBTRACE (3);
     return EFI_UNSUPPORTED;
   }
   if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
-    Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
+    DBTRACE (4);
     return EFI_BAD_BUFFER_SIZE;
   }
   ZeroMem (CommandLine, sizeof (CommandLine));
@@ -523,6 +659,8 @@ Boot (
       CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
     }
   }
+  BandInit ();
+
   Root = NULL;
   Image = NULL;
   Tree = NULL;
@@ -533,21 +671,46 @@ Boot (
   Map = NULL;
   Address = 0;
   Capacity = 0;
+  DBTRACE (5);
   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
-  if (EFI_ERROR (Status)) { return Status; }
+  if (EFI_ERROR (Status)) { DBTRACE (0x500 | ((UINT64)Status << 24)); return Status; }
+  DBTRACE (6);
   Status = Fs->OpenVolume (Fs, &Root);
-  if (EFI_ERROR (Status)) { return Status; }
+  if (EFI_ERROR (Status)) { DBTRACE (0x600 | ((UINT64)Status << 24)); return Status; }
+  DBTRACE (7);
+  Print (L"DARWINBOOT: reading kernel\n");
   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  { CHAR16 T[96]; UnicodeSPrint (T, sizeof (T), L"DB11 read %lu bytes %r", (UINT64)ImageSize, Status); Band (T); }
+  if (EFI_ERROR (Status)) {
+    DBTRACE (0x700 | ((UINT64)Status << 24));
+    Status = EFI_VOLUME_CORRUPTED;
+    goto Fail;
+  }
+  //
+  // What the kernel read actually produced: a wrong entry here looks exactly like a wrong
+  // file until the size and the first word are compared.
+  //
+  *(volatile UINT64 *)(UINTN)0x9FFFE010 = (UINT64)ImageSize;
+  *(volatile UINT64 *)(UINTN)0x9FFFE018 = (Image == NULL) ? 0 : (UINT64)(*(UINT32 *)Image);
+  Band (L"DB12 parsing");
   Status = ParseKernel (Image, ImageSize, &Kernel);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  { CHAR16 T[96]; UnicodeSPrint (T, sizeof (T), L"DB13 parsed %r segs %lu", Status, (UINT64)Kernel.Count); Band (T); }
+  if (EFI_ERROR (Status)) {
+    DBTRACE (0x900 | ((UINT64)Status << 24));
+    Status = EFI_LOAD_ERROR;
+    goto Fail;
+  }
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  if (EFI_ERROR (Status)) {
+    DBTRACE (0x800 | ((UINT64)Status << 24));
+    Status = EFI_COMPROMISED_DATA;
+    goto Fail;
+  }
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;
@@ -557,7 +720,8 @@ Boot (
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
-  if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
+  DBTRACE (0xA01); Band (L"DB14 A01");
+  if (Kernel.Base > MAX_UINT64 - WindowSize) { DBTRACE (0xA02); Print (L"DARWINBOOT: stage A02\n"); Status = EFI_LOAD_ERROR; goto Fail; }
   if (Request->Ramdisk != NULL) {
     if ((RamdiskOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + RamdiskOffset) != 0) ||
         (U64 ((UINT8 *)Tree + RamdiskOffset + 8) != 0)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
@@ -565,6 +729,7 @@ Boot (
     Status = EFI_UNSUPPORTED;
     goto Fail;
   }
+  DBTRACE (0xA03); Print (L"DARWINBOOT: stage A03\n");
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
   Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
@@ -597,10 +762,13 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
+  DBTRACE (0xA04); Print (L"DARWINBOOT: stage A04\n");
   Status = ReadBootVideo (Video);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  if (EFI_ERROR (Status)) { DBTRACE (0xA05 | ((UINT64)Status << 24)); goto Fail; }
+  DBTRACE (0xA06); Print (L"DARWINBOOT: stage A06\n");
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  if (EFI_ERROR (Status)) { DBTRACE (0xA07 | ((UINT64)Status << 24)); goto Fail; }
+  DBTRACE (0xA08); Print (L"DARWINBOOT: stage A08\n");
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
@@ -649,12 +817,14 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
     FreePool (Addon); Addon = NULL;
   }
-  FreePool (Image); Image = NULL;
+  FreePages (Image, EFI_SIZE_TO_PAGES (ImageSize)); Image = NULL;
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
+  DBTRACE (0xA09); Print (L"DARWINBOOT: stage A09\n");
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  if (EFI_ERROR (Status)) { DBTRACE (0xA0A | ((UINT64)Status << 24)); goto Fail; }
+  DBTRACE (0xA0B);
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
@@ -700,7 +870,7 @@ Boot (
   return EFI_ABORTED;
 Fail:
   if (Root != NULL) { Root->Close (Root); }
-  if (Image != NULL) { FreePool (Image); }
+  if (Image != NULL) { FreePages (Image, EFI_SIZE_TO_PAGES (ImageSize)); }
   if (Tree != NULL) { FreePool (Tree); }
   if (TrustCaches != NULL) { FreePool (TrustCaches); }
   if (Addon != NULL) { FreePool (Addon); }
