@@ -21,11 +21,13 @@
 #define BLOCK_SIZE   SIZE_2MB
 
 //
-// One past the top of the RAM this board actually has.
+// The top of the low window this loader allocates from.
 //
-// From /proc/iomem on the running phone: 0x9B000000..0xABFFFFFF and 0xAD000000..0xBB AFFFFF.
-// A page allocated above this is not memory, and AllocatePages returned 0x35C989000 once - ten
-// gigabytes past the end of anything described - so the ceiling is stated here and checked.
+// A page placed above this was seen to break a following read, so ReadFile keeps its
+// buffers below DRAM_TOP and starts them DRAM_TOP - size lower still. That is a policy of
+// this loader, chosen for a window that was observed to work; it is not a measurement of
+// all the RAM the device has, and it does not override the firmware's memory map, which
+// remains the authority on what is actually memory.
 //
 #define DRAM_TOP     0xBC000000U
 #define MAX_SEGMENTS 64
@@ -58,8 +60,10 @@ VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, 
 // Print() writes to the text console, and on this board that console is not the surface UniXNU
 // paints: lines appear there only by accident, and the screen keeps showing an older frame, so
 // a boot that stalls after "getinfo" looks exactly like one that never printed it. OutputString
-// on gST->ConOut reaches the same console the menu text uses, and a form feed ahead of each line
-// replaces the frame rather than scrolling behind it.
+// on gST->ConOut reaches the same console the menu text uses, and each line is preceded by a
+// form feed, which the terminal moves the cursor with rather than scrolling behind. A form feed
+// is a request, not a guarantee: a terminal that ignores it leaves the earlier frame partly in
+// view, and ConOut itself may have been left stale by an earlier user of the console.
 //
 STATIC
 VOID
@@ -118,19 +122,38 @@ ReadFile (
   EFI_FILE_INFO      *Info;
   UINTN              InfoSize;
   UINTN              Actual;
+  UINTN              AllocatedSize;
+  BOOLEAN            PagesAllocated;
 
+  if ((Root == NULL) || (Path == NULL) || (Data == NULL) || (Size == NULL)) { return EFI_INVALID_PARAMETER; }
   *Data = NULL;
   *Size = 0;
+  File = NULL;
+  Info = NULL;
+  AllocatedSize = 0;
+  PagesAllocated = FALSE;
   Band (L"DB01 open");
   Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
-  Band (L"DB02 opened");
+  { CHAR16 T[128]; UnicodeSPrint (T, sizeof (T), L"DB02 opened %r file %p path %s",
+                                  Status, File, Path); Band (T); }
   if (EFI_ERROR (Status)) { return Status; }
+  if (File == NULL) {
+    //
+    // A reader that reports success and hands back nothing cannot be used; the close
+    // in Done is guarded on File for the same reason.
+    //
+    Band (L"DB02a opened without a file");
+    return EFI_DEVICE_ERROR;
+  }
   Info = AllocatePages (EFI_SIZE_TO_PAGES (SIZE_OF_EFI_FILE_INFO + 512));
   if (Info == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Done; }
   InfoSize = SIZE_OF_EFI_FILE_INFO + 512;
   Band (L"DB03 getinfo");
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
-  Band (L"DB04 gotinfo");
+  { CHAR16 T[128]; UnicodeSPrint (T, sizeof (T), L"DB04 gotinfo %r attr %lx size %lu",
+                                  Status,
+                                  (Status == EFI_SUCCESS) ? (UINT64)Info->Attribute : 0,
+                                  (Status == EFI_SUCCESS) ? (UINT64)Info->FileSize : 0); Band (T); }
   if (Status != EFI_SUCCESS) { Print (L"DARWINBOOT: getinfo failed\n"); goto Done; }
   Band (L"DB05 check");
   if ((Info->Attribute & EFI_FILE_DIRECTORY) || (Info->FileSize == 0) || (Info->FileSize > Limit)) {
@@ -139,7 +162,14 @@ ReadFile (
     goto Done;
   }
   *Size = (UINTN)Info->FileSize;
-  Band (L"DB06 sized");
+  //
+  // Name and size together, and read as what they are: FileName is the path the
+  // file-system driver reports for the request that was made, not proof of the directory
+  // entry the medium actually holds. A name that differs from the request is a signal
+  // worth looking at; a name that matches does not verify the file.
+  //
+  { CHAR16 T[128]; UnicodeSPrint (T, sizeof (T), L"DB06 sized %lu phys %lu as %s",
+                                  (UINT64)Info->FileSize, (UINT64)Info->PhysicalSize, Info->FileName); Band (T); }
 
   //
   // Pages, not the pool.
@@ -152,34 +182,62 @@ ReadFile (
   //
   // A buffer the kernel can actually be read into.
   //
-  // AllocatePages returned 0x35C989000 for this request - fourteen gigabytes, past the end of
-  // every range this platform describes. The read that followed never returned, which is what
-  // writing to an address no MMU entry covers does here. So the address is checked before it
-  // is used: anything outside the RAM this board actually has is rejected, and the buffer is
-  // then taken from a conventional range in the map by hand.
+  // AllocatePages handed back an address far past everything this platform describes, and the
+  // read that followed never returned, which is what writing to an address no MMU entry covers
+  // looks like here. So the address is checked before it is used, against DRAM_TOP.
+  //
+  // DRAM_TOP marks the low window this loader allocates from; it is a policy choice made
+  // here, not a measurement of all RAM on the device. The firmware's memory map stays the
+  // authority on what is actually memory.
   //
   Band (L"DB07 alloc");
   *Data = NULL;
-  //
-  // The top of the RAM this board actually has, from /proc/iomem on the running phone:
-  // 0x9B000000..0xABFFFFFF and 0xAD000000..0xBB AFFFFF. Ten gigabytes of headroom above that
-  // is not memory, and asking for a page there is what produced 0x35C989000.
-  //
-  //
   {
     EFI_PHYSICAL_ADDRESS  Pages;
+    EFI_STATUS            AllocateStatus;
 
-    Pages = DRAM_TOP;
-    if (!EFI_ERROR (gBS->AllocatePages (AllocateMaxAddress, EfiLoaderData, EFI_SIZE_TO_PAGES (*Size), &Pages))) {
+    //
+    // A conservative selected-low-window cap, kept as it was: the ceiling handed to the
+    // allocator is the top of the window minus the buffer. Under the specification
+    // AllocateMaxAddress bounds the whole allocation, so DRAM_TOP alone would already be
+    // enough; asking lower as well costs nothing and keeps the policy explicit.
+    //
+    // The range the firmware actually returns is then checked on its own (below), and a
+    // returned range that fails that check is freed before *Data is cleared. None of this is
+    // a diagnosis of how much RAM the device has.
+    //
+    // *Size is below 128 MiB for every caller and DRAM_TOP is 3 GiB, so the subtraction does
+    // not borrow; it is nevertheless written so that it cannot go below zero.
+    //
+    Pages = (*Size <= DRAM_TOP) ? (DRAM_TOP - *Size) : 0;
+    AllocateStatus = gBS->AllocatePages (AllocateMaxAddress, EfiLoaderData, EFI_SIZE_TO_PAGES (*Size), &Pages);
+    if (!EFI_ERROR (AllocateStatus)) {
+      //
+      // Recorded so that a range that is freed below is only ever freed when the firmware
+      // reported one.
+      //
       *Data = (VOID *)(UINTN)Pages;
+      AllocatedSize = *Size;
+      PagesAllocated = TRUE;
     }
 
-    if ((*Data == NULL) || ((UINTN)*Data >= DRAM_TOP)) {
+    //
+    // Subtraction, not addition: an end computed as start + size can wrap, and a wrapped end
+    // compares as inside the window.
+    //
+    if (PagesAllocated &&
+        (((UINTN)*Data > (UINTN)DRAM_TOP) || ((UINTN)*Size > (UINTN)(DRAM_TOP - (UINTN)*Data)))) {
       CHAR16  Where[96];
 
       UnicodeSPrint (Where, sizeof (Where), L"DB07a no page under DRAM top %p", *Data);
       Band (Where);
+      //
+      // A range the firmware did report is handed back, not dropped: the caller sees
+      // *Data NULL and must not free it a second time.
+      //
+      FreePages (*Data, EFI_SIZE_TO_PAGES (AllocatedSize));
       *Data = NULL;
+      PagesAllocated = FALSE;
     }
   }
 
@@ -228,8 +286,14 @@ ReadFile (
   if (!EFI_ERROR (Status) && (Actual != *Size)) { Status = EFI_DEVICE_ERROR; }
 Done:
   if (Info != NULL) { FreePages (Info, EFI_SIZE_TO_PAGES (SIZE_OF_EFI_FILE_INFO + 512)); }
-  File->Close (File);
-  if (EFI_ERROR (Status) && (*Data != NULL)) { FreePages (*Data, EFI_SIZE_TO_PAGES (*Size)); *Data = NULL; }
+  if (File != NULL) { File->Close (File); }
+  //
+  // Freed with the size the firmware was asked for, and only when it reported a range.
+  //
+  if (EFI_ERROR (Status) && PagesAllocated && (*Data != NULL)) {
+    FreePages (*Data, EFI_SIZE_TO_PAGES (AllocatedSize));
+    *Data = NULL;
+  }
   return Status;
 }
 
@@ -248,12 +312,23 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
   BOOLEAN  HasEntry;
   BOOLEAN  Executable;
 
+  //
+  // Cleared before anything else, and before the header is looked at.
+  //
+  // A refused header or a NULL Data returns with Count 0, and the caller reports
+  // Kernel.Count to the screen: clearing it here keeps a refused image from printing
+  // whatever happened to be on the stack. A NULL Data is refused so that a caller that
+  // passes nothing gets an error instead of a read. An error found after the header is
+  // accepted may return a Count that reflects the segments parsed so far.
+  //
+  if (Kernel == NULL) { return EFI_INVALID_PARAMETER; }
+  ZeroMem (Kernel, sizeof (*Kernel));
+  if (Data == NULL) { return EFI_INVALID_PARAMETER; }
   if ((Size < 32) || (U32 (Data) != 0xfeedfacf) || (U32 (Data + 4) != 0x100000c) ||
       (U32 (Data + 8) != 0) || (U32 (Data + 12) != 2)) {
     return EFI_UNSUPPORTED;
   }
   if (U32 (Data + 20) > Size - 32) { return EFI_LOAD_ERROR; }
-  ZeroMem (Kernel, sizeof (*Kernel));
   Count = U32 (Data + 16);
   End = 32 + U32 (Data + 20);
   Offset = 32;
@@ -680,7 +755,25 @@ Boot (
   DBTRACE (7);
   Print (L"DARWINBOOT: reading kernel\n");
   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
-  { CHAR16 T[96]; UnicodeSPrint (T, sizeof (T), L"DB11 read %lu bytes %r", (UINT64)ImageSize, Status); Band (T); }
+  //
+  // The size and the first words together: a file of the right size with the wrong header and a
+  // file of the wrong size are different faults, and only this pair tells them apart.
+  //
+  // Each word is read only once the buffer is known to hold it, and through the unaligned
+  // reader the rest of this file uses. On a failed read ImageSize is zero and both words
+  // come out zero, so nothing here depends on what a failed read left behind.
+  {
+    CHAR16  T[128];
+    UINTN   Available;
+    UINT32  Word0;
+    UINT32  Word1;
+
+    Available = (Image == NULL) ? 0 : ImageSize;
+    Word0 = (Available >= 4) ? U32 (Image) : 0;
+    Word1 = (Available >= 8) ? U32 ((CONST UINT8 *)Image + 4) : 0;
+    UnicodeSPrint (T, sizeof (T), L"DB11 read %lu bytes %r first %08x %08x", (UINT64)ImageSize, Status, Word0, Word1);
+    Band (T);
+  }
   if (EFI_ERROR (Status)) {
     DBTRACE (0x700 | ((UINT64)Status << 24));
     Status = EFI_VOLUME_CORRUPTED;
@@ -688,10 +781,11 @@ Boot (
   }
   //
   // What the kernel read actually produced: a wrong entry here looks exactly like a wrong
-  // file until the size and the first word are compared.
+  // file until the size and the first word are compared. Both come from the reading of the
+  // buffer done above, so nothing here dereferences Image again.
   //
   *(volatile UINT64 *)(UINTN)0x9FFFE010 = (UINT64)ImageSize;
-  *(volatile UINT64 *)(UINTN)0x9FFFE018 = (Image == NULL) ? 0 : (UINT64)(*(UINT32 *)Image);
+  *(volatile UINT64 *)(UINTN)0x9FFFE018 = (Image == NULL) ? 0 : (UINT64)U32 (Image);
   Band (L"DB12 parsing");
   Status = ParseKernel (Image, ImageSize, &Kernel);
   { CHAR16 T[96]; UnicodeSPrint (T, sizeof (T), L"DB13 parsed %r segs %lu", Status, (UINT64)Kernel.Count); Band (T); }
@@ -700,6 +794,11 @@ Boot (
     Status = EFI_LOAD_ERROR;
     goto Fail;
   }
+  // Gauguin bring-up checkpoint: leave the successful read/parse result
+  // visible before later handoff code can reset or replace the screen.
+  // Bounded boot-services delay, not an infinite hold or a kernel change.
+  Band (L"DB13 parsed Success: kernel read verified; observing 15 seconds");
+  gBS->Stall (15000000);
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
@@ -781,11 +880,43 @@ Boot (
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
+  {
+    CHAR16  Where[128];
+
+    UnicodeSPrint (Where, sizeof (Where), L"A08a addr %lx used %lx base %lx end %lx",
+                   (UINT64)Address, (UINT64)Used, (UINT64)Kernel.Base, (UINT64)Kernel.End);
+    Band (Where);
+  }
+
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
+  Band (L"A08b zeroed");
   for (Index = 0; Index < Kernel.Count; Index++) {
+    //
+    // A segment whose address is below the kernel base would make the destination an
+    // underflow - a huge address, and a write to it is what a stop with no output looks like.
+    // Bands describe each one before it is copied, so a stop names the segment responsible.
+    //
+    {
+      CHAR16  Where[128];
+
+      UnicodeSPrint (Where, sizeof (Where), L"A08c seg %lu at %lx size %lx file %lx",
+                     (UINT64)Index,
+                     (UINT64)Kernel.Segments[Index].Address,
+                     (UINT64)Kernel.Segments[Index].FileSize,
+                     (UINT64)Kernel.Segments[Index].FileOffset);
+      Band (Where);
+    }
+
+    if (Kernel.Segments[Index].Address < Kernel.Base) {
+      Band (L"A08x segment below base");
+      Status = EFI_LOAD_ERROR;
+      goto Fail;
+    }
+
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
   }
+  Band (L"A08d segments copied");
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
   Args->Version = 2;
@@ -809,19 +940,30 @@ Boot (
     CopyMem ((VOID *)(UINTN)TrustCacheAddress, TrustCaches, TrustCacheSize);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset), TrustCacheAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset + 8), TrustCacheSize);
-    FreePool (TrustCaches); TrustCaches = NULL;
+    FreePages (TrustCaches, EFI_SIZE_TO_PAGES (TrustCacheSize)); TrustCaches = NULL;
   }
   if (Addon != NULL) {
     CopyMem ((VOID *)(UINTN)AddonAddress, Addon, AddonSize);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset), AddonAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
-    FreePool (Addon); Addon = NULL;
+    FreePages (Addon, EFI_SIZE_TO_PAGES (AddonSize)); Addon = NULL;
   }
+  Band (L"A08e freeing image");
   FreePages (Image, EFI_SIZE_TO_PAGES (ImageSize)); Image = NULL;
-  FreePool (Tree); Tree = NULL;
+  Band (L"A08f image freed");
+  //
+  // Pages out, pages back in.
+  //
+  // ReadFile hands every buffer back from AllocatePages, and freeing one with FreePool does
+  // not come back: the pool keeps its own bookkeeping at the front of what it hands out, and
+  // the freed page has none of it. The boot stopped on "A08f image freed" for exactly this.
+  //
+  FreePages (Tree, EFI_SIZE_TO_PAGES (TreeSize)); Tree = NULL;
+  Band (L"A08g tree freed");
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
-  DBTRACE (0xA09); Print (L"DARWINBOOT: stage A09\n");
+  Band (L"A08h root closed");
+  DBTRACE (0xA09); Print (L"DARWINBOOT: stage A09\n"); Band (L"A09");
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { DBTRACE (0xA0A | ((UINT64)Status << 24)); goto Fail; }
   DBTRACE (0xA0B);
@@ -833,9 +975,11 @@ Boot (
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
   //
-  // The same facts in large type over the whole screen. The firmware's log
-  // draws far larger than the text console, and the form feed clears the
-  // screen first. This is what stays visible if the kernel never draws.
+  // The same facts in large type, in front of the hand-off. The firmware's log draws far
+  // larger than the text console, and the form feed ahead of the first line asks the
+  // terminal to start at the top; whether it repaints or leaves part of the earlier frame
+  // standing is up to the terminal, and PcdDebugPropertyMask (0x07) has the debug print
+  // enable bit set, so these lines go out on the standard error device.
   //
   DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
@@ -871,9 +1015,9 @@ Boot (
 Fail:
   if (Root != NULL) { Root->Close (Root); }
   if (Image != NULL) { FreePages (Image, EFI_SIZE_TO_PAGES (ImageSize)); }
-  if (Tree != NULL) { FreePool (Tree); }
-  if (TrustCaches != NULL) { FreePool (TrustCaches); }
-  if (Addon != NULL) { FreePool (Addon); }
+  if (Tree != NULL) { FreePages (Tree, EFI_SIZE_TO_PAGES (TreeSize)); }
+  if (TrustCaches != NULL) { FreePages (TrustCaches, EFI_SIZE_TO_PAGES (TrustCacheSize)); }
+  if (Addon != NULL) { FreePages (Addon, EFI_SIZE_TO_PAGES (AddonSize)); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
